@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import shlex
 import threading
 from collections.abc import Coroutine
 from concurrent.futures import Future
+from pathlib import PurePosixPath
 from typing import Any, cast
 
 _REMOTE_SPEC_TYPES = frozenset({"s3", "postgres", "cos", "oss", "obs"})
@@ -121,7 +123,18 @@ def _read_returns_str(backend: Any) -> bool:
     return ret is str or ret == "str"
 
 
+def _missing_execute_path_ops(backend: Any) -> bool:
+    if not callable(getattr(backend, "execute", None)):
+        return False
+    return any(
+        not callable(getattr(backend, name, None))
+        for name in ("mkdir_path", "delete_path", "move_path")
+    )
+
+
 def _needs_adapt(backend: Any) -> bool:
+    if _missing_execute_path_ops(backend):
+        return True
     try:
         from deepagents.backends.protocol import BackendProtocol
     except ImportError:
@@ -193,22 +206,43 @@ class _LegacyProtocolBackend:
         ls_info = getattr(self._inner, "ls_info", None)
         if callable(ls_info):
             return self._run(ls_info(path))
+        ls = getattr(self._inner, "ls", None)
+        if callable(ls):
+            result = self._run(ls(path))
+            entries = getattr(result, "entries", None)
+            if entries is not None:
+                return entries
         raise NotImplementedError
 
     async def als_info(self, path: str) -> Any:
         inner = getattr(self._inner, "als_info", None)
         if callable(inner):
             return await asyncio.to_thread(self._run, inner(path))
+        als = getattr(self._inner, "als", None)
+        if callable(als):
+            result = await asyncio.to_thread(self._run, als(path))
+            entries = getattr(result, "entries", None)
+            if entries is not None:
+                return entries
         return await asyncio.to_thread(self.ls_info, path)
 
     def ls(self, path: str) -> Any:
         from deepagents.backends.protocol import LsResult
 
+        ls_info = getattr(self._inner, "ls_info", None)
+        als_info = getattr(self._inner, "als_info", None)
+        if not callable(ls_info) and not callable(als_info):
+            ls = getattr(self._inner, "ls", None)
+            if callable(ls):
+                return self._run(ls(path))
         return LsResult(entries=list(self.ls_info(path) or []))
 
     async def als(self, path: str) -> Any:
         from deepagents.backends.protocol import LsResult
 
+        als = getattr(self._inner, "als", None)
+        if callable(als) and not callable(getattr(self._inner, "als_info", None)):
+            return await asyncio.to_thread(self._run, als(path))
         entries = await self.als_info(path)
         return LsResult(entries=list(entries or []))
 
@@ -303,10 +337,58 @@ class _LegacyProtocolBackend:
         return self._inner.edit(file_path, old_string, new_string, replace_all)
 
     def mkdir_path(self, path: str) -> None:
-        """Object-store / postgres prefixes have no real directories."""
         inner = getattr(self._inner, "mkdir_path", None)
         if callable(inner):
-            inner(path)
+            self._run(inner(path))
+            return
+        self._execute_path_command(f"mkdir -p {shlex.quote(path)}", f"mkdir failed for {path!r}")
+
+    async def amkdir_path(self, path: str) -> None:
+        inner = getattr(self._inner, "amkdir_path", None)
+        if callable(inner):
+            await asyncio.to_thread(self._run, inner(path))
+            return
+        await asyncio.to_thread(self.mkdir_path, path)
+
+    def delete_path(self, path: str) -> None:
+        inner = getattr(self._inner, "delete_path", None)
+        if callable(inner):
+            self._run(inner(path))
+            return
+        self._execute_path_command(f"rm -rf {shlex.quote(path)}", f"delete failed for {path!r}")
+
+    async def adelete_path(self, path: str) -> None:
+        inner = getattr(self._inner, "adelete_path", None)
+        if callable(inner):
+            await asyncio.to_thread(self._run, inner(path))
+            return
+        await asyncio.to_thread(self.delete_path, path)
+
+    def move_path(self, src: str, dest: str) -> None:
+        inner = getattr(self._inner, "move_path", None)
+        if callable(inner):
+            self._run(inner(src, dest))
+            return
+        dest_parent = str(PurePosixPath(dest).parent)
+        self._execute_path_command(
+            f"mkdir -p {shlex.quote(dest_parent)} && mv {shlex.quote(src)} {shlex.quote(dest)}",
+            f"move failed for {src!r} -> {dest!r}",
+        )
+
+    async def amove_path(self, src: str, dest: str) -> None:
+        inner = getattr(self._inner, "amove_path", None)
+        if callable(inner):
+            await asyncio.to_thread(self._run, inner(src, dest))
+            return
+        await asyncio.to_thread(self.move_path, src, dest)
+
+    def _execute_path_command(self, command: str, fallback_error: str) -> None:
+        execute = getattr(self._inner, "execute", None)
+        if not callable(execute):
+            return
+        result = self._run(execute(command))
+        if getattr(result, "exit_code", 0) not in (0, None):
+            raise OSError(getattr(result, "output", "") or fallback_error)
 
     def grep(self, *args: Any, **kwargs: Any) -> Any:
         return self._call_via_worker("grep", "agrep", *args, **kwargs)

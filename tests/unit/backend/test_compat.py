@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from deepagents.backends.protocol import BackendProtocol, ReadResult
+from octop_harness.backends.workspace import BackendWorkspace
 
 from octop.infra.backend.compat import adapt_backend_protocol, is_adapted_backend
 
@@ -146,6 +147,43 @@ def test_adapt_write_and_edit_use_current_result_types() -> None:
 def test_adapt_mkdir_path_is_noop() -> None:
     wrapped = adapt_backend_protocol(_LegacyRemote())
     wrapped.mkdir_path("/.octop")
+
+
+def test_adapt_execute_backend_provides_workspace_path_ops(tmp_path) -> None:
+    class _LegacySandbox(_LegacyRemote):
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def execute(self, command: str) -> SimpleNamespace:
+            self.commands.append(command)
+            return SimpleNamespace(exit_code=0, output="")
+
+    inner = _LegacySandbox()
+    wrapped = adapt_backend_protocol(inner)
+    workspace = BackendWorkspace(wrapped, tmp_path)
+
+    workspace.mkdir("/dir with space")
+    workspace.delete("/dir with space/old.txt")
+    workspace.move("/dir with space/src.txt", "/dir with space/nested/dest.txt")
+
+    assert inner.commands == [
+        "mkdir -p '/dir with space'",
+        "rm -rf '/dir with space/old.txt'",
+        "mkdir -p '/dir with space/nested' && mv '/dir with space/src.txt' "
+        "'/dir with space/nested/dest.txt'",
+    ]
+
+
+def test_adapt_execute_backend_path_ops_raise_on_failure() -> None:
+    class _FailingSandbox(_LegacyRemote):
+        def execute(self, command: str) -> SimpleNamespace:
+            del command
+            return SimpleNamespace(exit_code=1, output="remote denied")
+
+    wrapped = adapt_backend_protocol(_FailingSandbox())
+
+    with pytest.raises(OSError, match="remote denied"):
+        wrapped.mkdir_path("/blocked")
 
 
 @pytest.mark.asyncio
